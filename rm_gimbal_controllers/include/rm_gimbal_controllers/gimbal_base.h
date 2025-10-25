@@ -43,12 +43,14 @@
 #include <hardware_interface/imu_sensor_interface.h>
 #include <rm_common/hardware_interface/robot_state_interface.h>
 #include <rm_common/filters/filters.h>
+#include <rm_common/traj_gen.h>
 #include <rm_msgs/GimbalCmd.h>
 #include <rm_msgs/TrackData.h>
 #include <rm_msgs/GimbalDesError.h>
 #include <rm_msgs/GimbalPosState.h>
 #include <rm_gimbal_controllers/GimbalBaseConfig.h>
 #include <rm_gimbal_controllers/bullet_solver.h>
+#include <rm_gimbal_controllers/adrc_controller.h>
 #include <tf2_eigen/tf2_eigen.h>
 #include <Eigen/Eigen>
 #include <control_toolbox/pid.h>
@@ -61,7 +63,7 @@ namespace rm_gimbal_controllers
 {
 struct GimbalConfig
 {
-  double yaw_k_v_, pitch_k_v_, chassis_comp_a_, chassis_comp_b_, chassis_comp_c_, chassis_comp_d_;
+  double yaw_k_v_, pitch_k_v_, k_chassis_vel_;
   double accel_pitch_{}, accel_yaw_{};
 };
 
@@ -147,9 +149,8 @@ private:
   bool setDesIntoLimit(const tf2::Quaternion& base2gimbal_des, const urdf::JointConstSharedPtr& joint_urdf,
                        tf2::Quaternion& base2new_des);
   void moveJoint(const ros::Time& time, const ros::Duration& period);
-  void updateChassisVel();
   double feedForward(const ros::Time& time);
-  double updateCompensation(double chassis_vel_angular_z);
+  void updateChassisVel();
   void commandCB(const rm_msgs::GimbalCmdConstPtr& msg);
   void trackCB(const rm_msgs::TrackDataConstPtr& msg);
   void reconfigCB(rm_gimbal_controllers::GimbalBaseConfig& config, uint32_t);
@@ -158,6 +159,7 @@ private:
 
   rm_control::RobotStateHandle robot_state_handle_;
   hardware_interface::ImuSensorHandle imu_sensor_handle_;
+  std::unordered_map<int, std::unique_ptr<NonlinearTrackingDifferentiator<double>>> tracking_differentiator_;
   std::unordered_map<int, std::unique_ptr<effort_controllers::JointVelocityController>> ctrls_;
   std::unordered_map<int, std::unique_ptr<control_toolbox::Pid>> pid_pos_;
   std::unordered_map<int, urdf::JointConstSharedPtr> joint_urdfs_;
@@ -183,7 +185,7 @@ private:
   int loop_count_{};
 
   // Transform
-  geometry_msgs::TransformStamped odom2gimbal_des_, odom2gimbal_, odom2base_, last_odom2base_;
+  geometry_msgs::TransformStamped odom2gimbal_des_, odom2gimbal_, odom2base_, odom2chassis_, last_odom2chassis_;
 
   // Gravity Compensation
   geometry_msgs::Vector3 mass_origin_;
@@ -192,12 +194,13 @@ private:
 
   // Chassis
   std::shared_ptr<ChassisVel> chassis_vel_;
-  double chassis_compensation_;
 
   bool dynamic_reconfig_initialized_{};
   GimbalConfig config_{};
   realtime_tools::RealtimeBuffer<GimbalConfig> config_rt_buffer_;
   dynamic_reconfigure::Server<rm_gimbal_controllers::GimbalBaseConfig>* d_srv_{};
+
+  RampFilter<double>*ramp_rate_pitch_{}, *ramp_rate_yaw_{};
 
   enum
   {
@@ -208,6 +211,13 @@ private:
   };
   int state_ = RATE;
   bool start_ = false;
+
+  // ADRC: per-axis controllers mapped by axis index (0=roll/base_yaw, 1=pitch, 2=yaw)
+  std::unordered_map<int, std::unique_ptr<ADRCController>> adrc_controllers_;
+  std::unordered_map<int, bool> enable_adrc_per_axis_;
+  std::unordered_map<int, double> adrc_omega_o_per_axis_;
+  std::unordered_map<int, double> adrc_omega_c_per_axis_;
+  // Note: b0 is removed and fixed to 1.0 in ADRCController for velocity command output
 };
 
 }  // namespace rm_gimbal_controllers

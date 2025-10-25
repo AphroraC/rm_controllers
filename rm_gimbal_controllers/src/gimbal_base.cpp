@@ -69,10 +69,7 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
 
   config_ = { .yaw_k_v_ = getParam(controller_nh, "controllers/yaw/k_v", 0.),
               .pitch_k_v_ = getParam(controller_nh, "controllers/pitch/k_v", 0.),
-              .chassis_comp_a_ = getParam(controller_nh, "controllers/yaw/chassis_comp_a", 0.),
-              .chassis_comp_b_ = getParam(controller_nh, "controllers/yaw/chassis_comp_b", 0.),
-              .chassis_comp_c_ = getParam(controller_nh, "controllers/yaw/chassis_comp_c", 0.),
-              .chassis_comp_d_ = getParam(controller_nh, "controllers/yaw/chassis_comp_d", 0.),
+              .k_chassis_vel_ = getParam(controller_nh, "controllers/yaw/k_chassis_vel", 0.),
               .accel_pitch_ = getParam(controller_nh, "controllers/pitch/accel", 99.),
               .accel_yaw_ = getParam(controller_nh, "controllers/yaw/accel", 99.) };
   config_rt_buffer_.initRT(config_);
@@ -110,6 +107,9 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
         joint_urdfs_.insert(std::make_pair(axis, joint_urdf));
       }
 
+      double r = getParam(nh, "r", 200.);
+      tracking_differentiator_.insert(
+          std::make_pair(axis, std::make_unique<NonlinearTrackingDifferentiator<double>>(r, 0.001)));
       ctrls_.insert(std::make_pair(axis, std::make_unique<effort_controllers::JointVelocityController>()));
       pid_pos_.insert(std::make_pair(axis, std::make_unique<control_toolbox::Pid>()));
       pos_des_in_limit_.insert(std::make_pair(axis, true));
@@ -152,6 +152,49 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
   publish_rate_ = getParam(controller_nh, "publish_rate", 100.);
   error_pub_.reset(new realtime_tools::RealtimePublisher<rm_msgs::GimbalDesError>(controller_nh, "error", 100));
 
+  ramp_rate_pitch_ = new RampFilter<double>(0, 0.001);
+  ramp_rate_yaw_ = new RampFilter<double>(0, 0.001);
+
+  // Initialize ADRC for each controlled axis
+  double dt = 0.001;
+  for (const auto& ctrl : ctrls_)
+  {
+    int axis = ctrl.first;
+    std::string axis_name;
+    if (axis == 0)
+      axis_name = "roll";
+    else if (axis == 1)
+      axis_name = "pitch";
+    else if (axis == 2)
+      axis_name = "yaw";
+
+    // Check if ADRC is enabled for this axis
+    std::string axis_path = "controllers/" + 
+                            std::string(axis == 0 ? "base_yaw" : (axis == 1 ? "pitch" : "yaw"));
+    ros::NodeHandle axis_nh(controller_nh, axis_path);
+    bool enable_adrc = getParam(axis_nh, "enable_adrc", false);
+    enable_adrc_per_axis_[axis] = enable_adrc;
+
+    if (enable_adrc)
+    {
+      double omega_o = getParam(axis_nh, "adrc_omega_o", 100.0);
+      double omega_c = getParam(axis_nh, "adrc_omega_c", 30.0);
+      // Note: b0 is fixed to 1.0 in ADRCController, no need to read from config
+
+      adrc_omega_o_per_axis_[axis] = omega_o;
+      adrc_omega_c_per_axis_[axis] = omega_c;
+
+      adrc_controllers_[axis] = std::make_unique<ADRCController>(omega_o, omega_c, dt);
+
+      ROS_INFO("[Gimbal] ADRC enabled for axis %d (%s): omega_o=%.1f, omega_c=%.1f (velocity command mode)",
+               axis, axis_name.c_str(), omega_o, omega_c);
+    }
+    else
+    {
+      ROS_INFO("[Gimbal] ADRC disabled for axis %d (%s), using PID control", axis, axis_name.c_str());
+    }
+  }
+
   return true;
 }
 
@@ -167,14 +210,25 @@ void Controller::update(const ros::Time& time, const ros::Duration& period)
   cmd_gimbal_ = *cmd_rt_buffer_.readFromRT();
   data_track_ = *track_rt_buffer_.readFromNonRT();
   config_ = *config_rt_buffer_.readFromRT();
+  ramp_rate_pitch_->setAcc(config_.accel_pitch_);
+  ramp_rate_yaw_->setAcc(config_.accel_yaw_);
+  ramp_rate_pitch_->input(cmd_gimbal_.rate_pitch);
+  ramp_rate_yaw_->input(cmd_gimbal_.rate_yaw);
+  if (cmd_gimbal_.rate_yaw != 0)
+    ramp_rate_yaw_->clear(cmd_gimbal_.rate_yaw);
+  if (cmd_gimbal_.rate_pitch != 0)
+    ramp_rate_pitch_->clear(cmd_gimbal_.rate_pitch);
+  cmd_gimbal_.rate_pitch = ramp_rate_pitch_->output();
+  cmd_gimbal_.rate_yaw = ramp_rate_yaw_->output();
   try
   {
     odom2gimbal_ = robot_state_handle_.lookupTransform("odom", odom2gimbal_.child_frame_id, time);
     odom2base_ = robot_state_handle_.lookupTransform("odom", odom2base_.child_frame_id, time);
+    odom2chassis_ = robot_state_handle_.lookupTransform("odom", "base_link", time);
   }
   catch (tf2::TransformException& ex)
   {
-    ROS_WARN_THROTTLE(5, "%s\n", ex.what());
+    ROS_WARN_THROTTLE(1, "%s\n", ex.what());
     return;
   }
   updateChassisVel();
@@ -225,6 +279,10 @@ void Controller::rate(const ros::Time& time, const ros::Duration& period)
       odom2gimbal_des_.transform.rotation = odom2gimbal_.transform.rotation;
       odom2gimbal_des_.header.stamp = time;
       robot_state_handle_.setTransform(odom2gimbal_des_, "rm_gimbal_controllers");
+      double des[3]{ 0. };
+      quatToRPY(odom2gimbal_des_.transform.rotation, des[0], des[1], des[2]);
+      for (auto& td : tracking_differentiator_)
+        td.second->clear(des[td.first]);
       start_ = false;
     }
   }
@@ -339,6 +397,23 @@ void Controller::traj(const ros::Time& time)
   {  // on enter
     state_changed_ = false;
     ROS_INFO("[Gimbal] Enter TRAJ");
+    std::string frame_id;
+    if (!cmd_gimbal_.traj_frame_id.empty())
+      frame_id = cmd_gimbal_.traj_frame_id;
+    else
+      frame_id = "odom";
+    try
+    {
+      double traj[3]{ 0. };
+      geometry_msgs::TransformStamped odom2traj = robot_state_handle_.lookupTransform("odom", frame_id, time);
+      quatToRPY(odom2traj.transform.rotation, traj[0], traj[1], traj[2]);
+      for (auto& td : tracking_differentiator_)
+        td.second->clear(traj[td.first]);
+    }
+    catch (tf2::TransformException& ex)
+    {
+      ROS_WARN("%s", ex.what());
+    }
   }
   double traj[3]{ 0. };
   try
@@ -486,22 +561,120 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
   for (const auto& in_limit : pos_des_in_limit_)
     if (!in_limit.second)
       vel_des[in_limit.first] = 0.;
+  for (auto& td : tracking_differentiator_)
+  {
+    td.second->update(pos_des[td.first], vel_des[td.first]);
+    if(state_ != TRACK)
+      angle_error[td.first] = angles::shortest_angular_distance(pos_real[td.first], td.second->getX1());
+  }
 
+  // Control each axis (pitch: axis 1)
   if (pid_pos_.find(1) != pid_pos_.end() && ctrls_.find(1) != ctrls_.end())
   {
-    pid_pos_.at(1)->computeCommand(angle_error[1], period);
-    ctrls_.at(1)->setCommand(pid_pos_.at(1)->getCurrentCmd() + config_.pitch_k_v_ * vel_des[1] +
-                             ctrls_.at(1)->joint_.getVelocity() - angular_vel.y);
-    ctrls_.at(1)->update(time, period);
-    ctrls_.at(1)->joint_.setCommand(ctrls_.at(1)->joint_.getCommand() + feedForward(time));
+    if (enable_adrc_per_axis_[1] && adrc_controllers_.find(1) != adrc_controllers_.end() &&
+        tracking_differentiator_.find(1) != tracking_differentiator_.end())
+    {
+      // ADRC control for pitch (outputs velocity command)
+      double pitch_real = pos_real[1];
+      double pitch_des = tracking_differentiator_[1]->getX1();
+      double pitch_vel_des = tracking_differentiator_[1]->getX2();
+
+      // Get velocity command from ADRC
+      double vel_cmd = adrc_controllers_[1]->computeVelocityCommand(pitch_real, pitch_des, pitch_vel_des);
+      
+      // Add velocity feedback compensation: vel_cmd + (imu_vel - encoder_vel)
+      // When IMU detects faster motion than encoder, increase command to compensate
+      ctrls_.at(1)->setCommand(vel_cmd + angular_vel.y - ctrls_.at(1)->joint_.getVelocity());
+      ctrls_.at(1)->update(time, period);
+      ctrls_.at(1)->joint_.setCommand(ctrls_.at(1)->joint_.getCommand() + feedForward(time));
+
+      ROS_DEBUG_THROTTLE(1.0, "Pitch ADRC: des=%.3f, real=%.3f, vel_cmd=%.3f, vel_fb=%.3f, d=%.3f", 
+                         pitch_des, pitch_real, vel_cmd, 
+                         angular_vel.y - ctrls_.at(1)->joint_.getVelocity(),
+                         adrc_controllers_[1]->getDisturbance());
+    }
+    else
+    {
+      // PID control for pitch
+      pid_pos_.at(1)->computeCommand(angle_error[1], period);
+      ctrls_.at(1)->setCommand(pid_pos_.at(1)->getCurrentCmd() + config_.pitch_k_v_ * vel_des[1] +
+                               ctrls_.at(1)->joint_.getVelocity() - angular_vel.y);
+      ctrls_.at(1)->update(time, period);
+      ctrls_.at(1)->joint_.setCommand(ctrls_.at(1)->joint_.getCommand() + feedForward(time));
+    }
   }
+
+  // Control yaw axis (axis 2)
   if (pid_pos_.find(2) != pid_pos_.end() && ctrls_.find(2) != ctrls_.end())
   {
-    pid_pos_.at(2)->computeCommand(angle_error[2], period);
-    ctrls_.at(2)->setCommand(pid_pos_.at(2)->getCurrentCmd() -
-                             updateCompensation(chassis_vel_->angular_->z()) * chassis_vel_->angular_->z() +
-                             config_.yaw_k_v_ * vel_des[2] + ctrls_.at(2)->joint_.getVelocity() - angular_vel.z);
-    ctrls_.at(2)->update(time, period);
+    if (enable_adrc_per_axis_[2] && adrc_controllers_.find(2) != adrc_controllers_.end() &&
+        tracking_differentiator_.find(2) != tracking_differentiator_.end())
+    {
+      // ADRC control for yaw (outputs velocity command)
+      double yaw_real = pos_real[2];
+      double yaw_des = tracking_differentiator_[2]->getX1();
+      double yaw_vel_des = tracking_differentiator_[2]->getX2();
+
+      // Get velocity command from ADRC
+      double vel_cmd = adrc_controllers_[2]->computeVelocityCommand(yaw_real, yaw_des, yaw_vel_des);
+      
+      // Add velocity feedback compensation and chassis velocity compensation
+      // vel_cmd + (imu_vel - encoder_vel) - chassis_compensation
+      ctrls_.at(2)->setCommand(vel_cmd - config_.k_chassis_vel_ * chassis_vel_->angular_->z() +
+                               angular_vel.z - ctrls_.at(2)->joint_.getVelocity());
+      ctrls_.at(2)->update(time, period);
+
+      ROS_DEBUG_THROTTLE(1.0, "Yaw ADRC: des=%.3f, real=%.3f, vel_cmd=%.3f, vel_fb=%.3f, d=%.3f", 
+                         yaw_des, yaw_real, vel_cmd,
+                         angular_vel.z - ctrls_.at(2)->joint_.getVelocity(),
+                         adrc_controllers_[2]->getDisturbance());
+    }
+    else
+    {
+      // PID control for yaw
+      pid_pos_.at(2)->computeCommand(angle_error[2], period);
+      ctrls_.at(2)->setCommand(pid_pos_.at(2)->getCurrentCmd() - config_.k_chassis_vel_ * chassis_vel_->angular_->z() +
+                               config_.yaw_k_v_ * vel_des[2] + ctrls_.at(2)->joint_.getVelocity() - angular_vel.z);
+      ctrls_.at(2)->update(time, period);
+    }
+  }
+
+  // Control base_yaw axis (axis 0)
+  if (pid_pos_.find(0) != pid_pos_.end() && ctrls_.find(0) != ctrls_.end())
+  {
+    if (enable_adrc_per_axis_[0] && adrc_controllers_.find(0) != adrc_controllers_.end() &&
+        tracking_differentiator_.find(0) != tracking_differentiator_.end())
+    {
+      // ADRC control for base_yaw (outputs velocity command)
+      double base_yaw_real = pos_real[0];
+      double base_yaw_des = tracking_differentiator_[0]->getX1();
+      double base_yaw_vel_des = tracking_differentiator_[0]->getX2();
+
+      // Get velocity command from ADRC
+      double vel_cmd = adrc_controllers_[0]->computeVelocityCommand(base_yaw_real, base_yaw_des, base_yaw_vel_des);
+      
+      // Add velocity feedback compensation if IMU available
+      // Note: base_yaw might not have direct IMU feedback on roll axis
+      if (has_imu_ && ctrls_.find(0) != ctrls_.end())
+      {
+        ctrls_.at(0)->setCommand(vel_cmd + angular_vel.x - ctrls_.at(0)->joint_.getVelocity());
+      }
+      else
+      {
+        ctrls_.at(0)->setCommand(vel_cmd);
+      }
+      ctrls_.at(0)->update(time, period);
+
+      ROS_DEBUG_THROTTLE(1.0, "Base_Yaw ADRC: des=%.3f, real=%.3f, vel_cmd=%.3f, d=%.3f",
+                         base_yaw_des, base_yaw_real, vel_cmd, adrc_controllers_[0]->getDisturbance());
+    }
+    else
+    {
+      // PID control for base_yaw
+      pid_pos_.at(0)->computeCommand(angle_error[0], period);
+      ctrls_.at(0)->setCommand(pid_pos_.at(0)->getCurrentCmd() + config_.yaw_k_v_ * vel_des[0]);
+      ctrls_.at(0)->update(time, period);
+    }
   }
 
   // publish state
@@ -515,8 +688,8 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
         pub.second->msg_.set_point = pos_des[pub.first];
         pub.second->msg_.set_point_dot = vel_des[pub.first];
         pub.second->msg_.process_value = pos_real[pub.first];
-        pub.second->msg_.error = angle_error[pub.first];
-        pub.second->msg_.command = pid_pos_[pub.first]->getCurrentCmd();
+        pub.second->msg_.error = angles::shortest_angular_distance(pos_real[pub.first], pos_des[pub.first]);
+        pub.second->msg_.command = tracking_differentiator_[pub.first]->getX1();
         pub.second->unlockAndPublish();
       }
     }
@@ -548,14 +721,14 @@ double Controller::feedForward(const ros::Time& time)
 
 void Controller::updateChassisVel()
 {
-  double tf_period = odom2base_.header.stamp.toSec() - last_odom2base_.header.stamp.toSec();
-  double linear_x = (odom2base_.transform.translation.x - last_odom2base_.transform.translation.x) / tf_period;
-  double linear_y = (odom2base_.transform.translation.y - last_odom2base_.transform.translation.y) / tf_period;
-  double linear_z = (odom2base_.transform.translation.z - last_odom2base_.transform.translation.z) / tf_period;
+  double tf_period = odom2chassis_.header.stamp.toSec() - last_odom2chassis_.header.stamp.toSec();
+  double linear_x = (odom2chassis_.transform.translation.x - last_odom2chassis_.transform.translation.x) / tf_period;
+  double linear_y = (odom2chassis_.transform.translation.y - last_odom2chassis_.transform.translation.y) / tf_period;
+  double linear_z = (odom2chassis_.transform.translation.z - last_odom2chassis_.transform.translation.z) / tf_period;
   double last_angular_position_x, last_angular_position_y, last_angular_position_z, angular_position_x,
       angular_position_y, angular_position_z;
-  quatToRPY(odom2base_.transform.rotation, angular_position_x, angular_position_y, angular_position_z);
-  quatToRPY(last_odom2base_.transform.rotation, last_angular_position_x, last_angular_position_y,
+  quatToRPY(odom2chassis_.transform.rotation, angular_position_x, angular_position_y, angular_position_z);
+  quatToRPY(last_odom2chassis_.transform.rotation, last_angular_position_x, last_angular_position_y,
             last_angular_position_z);
   double angular_x = angles::shortest_angular_distance(last_angular_position_x, angular_position_x) / tf_period;
   double angular_y = angles::shortest_angular_distance(last_angular_position_y, angular_position_y) / tf_period;
@@ -563,7 +736,7 @@ void Controller::updateChassisVel()
   double linear_vel[3]{ linear_x, linear_y, linear_z };
   double angular_vel[3]{ angular_x, angular_y, angular_z };
   chassis_vel_->update(linear_vel, angular_vel, tf_period);
-  last_odom2base_ = odom2base_;
+  last_odom2chassis_ = odom2chassis_;
 }
 
 std::string Controller::getGimbalFrameID(std::unordered_map<int, urdf::JointConstSharedPtr> joint_urdfs)
@@ -588,13 +761,6 @@ std::string Controller::getBaseFrameID(std::unordered_map<int, urdf::JointConstS
   return std::string();
 }
 
-double Controller::updateCompensation(double chassis_vel_angular_z)
-{
-  chassis_compensation_ =
-      config_.chassis_comp_a_ * sin(config_.chassis_comp_b_ * chassis_vel_angular_z + config_.chassis_comp_c_) +
-      config_.chassis_comp_d_;
-  return chassis_compensation_;
-}
 
 void Controller::commandCB(const rm_msgs::GimbalCmdConstPtr& msg)
 {
@@ -616,20 +782,14 @@ void Controller::reconfigCB(rm_gimbal_controllers::GimbalBaseConfig& config, uin
     GimbalConfig init_config = *config_rt_buffer_.readFromNonRT();  // config init use yaml
     config.yaw_k_v_ = init_config.yaw_k_v_;
     config.pitch_k_v_ = init_config.pitch_k_v_;
-    config.chassis_comp_a_ = init_config.chassis_comp_a_;
-    config.chassis_comp_b_ = init_config.chassis_comp_b_;
-    config.chassis_comp_c_ = init_config.chassis_comp_c_;
-    config.chassis_comp_d_ = init_config.chassis_comp_d_;
+    config.k_chassis_vel_ = init_config.k_chassis_vel_;
     config.accel_pitch_ = init_config.accel_pitch_;
     config.accel_yaw_ = init_config.accel_yaw_;
     dynamic_reconfig_initialized_ = true;
   }
   GimbalConfig config_non_rt{ .yaw_k_v_ = config.yaw_k_v_,
                               .pitch_k_v_ = config.pitch_k_v_,
-                              .chassis_comp_a_ = config.chassis_comp_a_,
-                              .chassis_comp_b_ = config.chassis_comp_b_,
-                              .chassis_comp_c_ = config.chassis_comp_c_,
-                              .chassis_comp_d_ = config.chassis_comp_d_,
+                              .k_chassis_vel_ = config.k_chassis_vel_,
                               .accel_pitch_ = config.accel_pitch_,
                               .accel_yaw_ = config.accel_yaw_ };
   config_rt_buffer_.writeFromNonRT(config_non_rt);

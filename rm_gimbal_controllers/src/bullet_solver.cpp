@@ -393,8 +393,7 @@ double BulletSolver::getGimbalError(geometry_msgs::Point pos, geometry_msgs::Vec
         r * sin(yaw + v_yaw * (fly_time_ + delay) + selected_armor_ * 2 * M_PI / armors_num);
     target_pos_after_fly_time_and_delay.z = z + vel.z * (fly_time_ + delay);
     error = std::sqrt(std::pow(target_pos_.x - target_pos_after_fly_time_and_delay.x, 2) +
-                      std::pow(target_pos_.y - target_pos_after_fly_time_and_delay.y, 2) +
-                      std::pow(target_pos_.z - target_pos_after_fly_time_and_delay.z, 2));
+                      std::pow(target_pos_.y - target_pos_after_fly_time_and_delay.y, 2));
   }
   return error;
 }

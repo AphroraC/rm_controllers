@@ -32,36 +32,40 @@
  *******************************************************************************/
 
 //
-// Created by cch on 24-8-7.
+// Created by qiayuan on 1/16/21.
 //
 
 #pragma once
-#include "effort_controllers/joint_position_controller.h"
-#include "effort_controllers/joint_effort_controller.h"
-#include "rm_calibration_controllers/calibration_base.h"
 
-namespace rm_calibration_controllers
+#include "rm_gimbal_controllers/gimbal_base.h"
+
+#include <effort_controllers/joint_velocity_controller.h>
+#include <controller_interface/multi_interface_controller.h>
+#include <hardware_interface/joint_command_interface.h>
+#include <hardware_interface/imu_sensor_interface.h>
+#include <rm_common/hardware_interface/robot_state_interface.h>
+#include <urdf/model.h>
+
+namespace rm_gimbal_controllers
 {
-class DifferentialCalibrationController
-  : public CalibrationBase<rm_control::ActuatorExtraInterface, hardware_interface::EffortJointInterface>
+class DualStageController : public ControllerBase<rm_control::RobotStateInterface,
+                                                  hardware_interface::ImuSensorInterface,
+                                                  hardware_interface::EffortJointInterface>
 {
 public:
-  DifferentialCalibrationController() = default;
+  DualStageController() = default;
   bool init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& root_nh, ros::NodeHandle& controller_nh) override;
   void update(const ros::Time& time, const ros::Duration& period) override;
 
-private:
-  enum State
-  {
-    MOVING_POSITIVE = 3,
-    MOVING_NEGATIVE,
-  };
-  ros::Time start_time_;
-  int countdown_{};
-  double velocity_threshold_{}, max_calibretion_time_{}, position_threshold_{};
-  rm_control::ActuatorExtraHandle actuator2_;
-  effort_controllers::JointVelocityController velocity_ctrl2_;
-  effort_controllers::JointEffortController effort_ctrl_;
-  effort_controllers::JointPositionController position_ctrl2_;
+protected:
+  void commandCB(const rm_msgs::GimbalCmdConstPtr& msg);
+  void trackCB(const rm_msgs::TrackDataConstPtr& msg);
+
+  void rate(const ros::Time& time, const ros::Duration& period) override;
+  void track(const ros::Time& time) override;
+  void direct(const ros::Time& time) override;
+
+  void moveJoint(const ros::Time& time, const ros::Duration& period) override;
 };
-}  // namespace rm_calibration_controllers
+
+}  // namespace rm_gimbal_controllers

@@ -75,31 +75,30 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
   };
   d_srv_->setCallback(cb);
 
-  XmlRpc::XmlRpcValue friction;
-  double wheel_speed_offset;
-  double wheel_speed_direction;
   effort_joint_interface_ = robot_hw->get<hardware_interface::EffortJointInterface>();
-  controller_nh.getParam("friction", friction);
-  for (const auto& its : friction)
+  XmlRpc::XmlRpcValue friction_left, friction_right;
+  controller_nh.getParam("friction_left", friction_left);
+  controller_nh.getParam("friction_right", friction_right);
+  double wheel_speed_offset;
+  for (const auto& it : friction_left)
   {
-    std::vector<double> wheel_speed_offset_temp;
-    std::vector<double> wheel_speed_direction_temp;
-    std::vector<effort_controllers::JointVelocityController*> ctrl_frictions;
-    for (const auto& it : its.second)
-    {
-      ros::NodeHandle nh = ros::NodeHandle(controller_nh, "friction/" + its.first + "/" + it.first);
-      wheel_speed_offset_temp.push_back(nh.getParam("wheel_speed_offset", wheel_speed_offset) ? wheel_speed_offset : 0.);
-      wheel_speed_direction_temp.push_back(
-          nh.getParam("wheel_speed_direction", wheel_speed_direction) ? wheel_speed_direction : 1.);
-      effort_controllers::JointVelocityController* ctrl_friction = new effort_controllers::JointVelocityController;
-      if (ctrl_friction->init(effort_joint_interface_, nh))
-        ctrl_frictions.push_back(ctrl_friction);
-      else
-        return false;
-    }
-    ctrls_friction_.push_back(ctrl_frictions);
-    wheel_speed_offsets_.push_back(wheel_speed_offset_temp);
-    wheel_speed_directions_.push_back(wheel_speed_direction_temp);
+    ros::NodeHandle nh = ros::NodeHandle(controller_nh, "friction_left/" + it.first);
+    wheel_speed_offset_l_.push_back(nh.getParam("wheel_speed_offset", wheel_speed_offset) ? wheel_speed_offset : 0.);
+    effort_controllers::JointVelocityController* ctrl_friction_l = new effort_controllers::JointVelocityController;
+    if (ctrl_friction_l->init(effort_joint_interface_, nh))
+      ctrls_friction_l_.push_back(ctrl_friction_l);
+    else
+      return false;
+  }
+  for (const auto& it : friction_right)
+  {
+    ros::NodeHandle nh = ros::NodeHandle(controller_nh, "friction_right/" + it.first);
+    wheel_speed_offset_r_.push_back(nh.getParam("wheel_speed_offset", wheel_speed_offset) ? wheel_speed_offset : 0.);
+    effort_controllers::JointVelocityController* ctrl_friction_r = new effort_controllers::JointVelocityController;
+    if (ctrl_friction_r->init(effort_joint_interface_, nh))
+      ctrls_friction_r_.push_back(ctrl_friction_r);
+    else
+      return false;
   }
   lp_filter_ = new LowPassFilter(controller_nh);
   ros::NodeHandle nh_trigger = ros::NodeHandle(controller_nh, "trigger");
@@ -156,13 +155,10 @@ void Controller::update(const ros::Time& time, const ros::Duration& period)
     shoot_state_pub_->msg_.state = state_;
     shoot_state_pub_->unlockAndPublish();
   }
-  for (auto& ctrl_frictions : ctrls_friction_)
-  {
-    for (auto& ctrl_friction : ctrl_frictions)
-    {
-      ctrl_friction->update(time, period);
-    }
-  }
+  for (auto& ctrl_friction_l : ctrls_friction_l_)
+    ctrl_friction_l->update(time, period);
+  for (auto& ctrl_friction_r : ctrls_friction_r_)
+    ctrl_friction_r->update(time, period);
   ctrl_trigger_.update(time, period);
 }
 
@@ -172,13 +168,11 @@ void Controller::stop(const ros::Time& time, const ros::Duration& period)
   {  // on enter
     state_changed_ = false;
     ROS_INFO("[Shooter] Enter STOP");
-    for (auto& ctrl_frictions : ctrls_friction_)
-    {
-      for (auto& ctrl_friction : ctrl_frictions)
-      {
-        ctrl_friction->setCommand(0.);
-      }
-    }
+
+    for (auto& ctrl_friction_l : ctrls_friction_l_)
+      ctrl_friction_l->setCommand(0.);
+    for (auto& ctrl_friction_r : ctrls_friction_r_)
+      ctrl_friction_r->setCommand(0.);
     ctrl_trigger_.setCommand(ctrl_trigger_.joint_.getPosition());
   }
 }
@@ -202,15 +196,17 @@ void Controller::push(const ros::Time& time, const ros::Duration& period)
     ROS_INFO("[Shooter] Enter PUSH");
   }
   bool wheel_speed_ready = true;
-  for (size_t i = 0; i < ctrls_friction_.size(); i++)
+  for (auto& ctrl_friction_l : ctrls_friction_l_)
   {
-    for (size_t j = 0; j < ctrls_friction_[i].size(); j++)
-    {
-      if (wheel_speed_directions_[i][j] * ctrls_friction_[i][j]->joint_.getVelocity() <
-              push_wheel_speed_threshold_ * ctrls_friction_[i][j]->command_ ||
-          wheel_speed_directions_[i][j] * ctrls_friction_[i][j]->joint_.getVelocity() <= M_PI)
-        wheel_speed_ready = false;
-    }
+    if (ctrl_friction_l->joint_.getVelocity() < push_wheel_speed_threshold_ * ctrl_friction_l->command_ ||
+        ctrl_friction_l->joint_.getVelocity() <= M_PI)
+      wheel_speed_ready = false;
+  }
+  for (auto& ctrl_friction_r : ctrls_friction_r_)
+  {
+    if (ctrl_friction_r->joint_.getVelocity() > push_wheel_speed_threshold_ * ctrl_friction_r->command_ ||
+        ctrl_friction_r->joint_.getVelocity() >= -M_PI)
+      wheel_speed_ready = false;
   }
   if ((cmd_.wheel_speed == 0. || wheel_speed_ready) && (time - last_shoot_time_).toSec() >= 1. / cmd_.hz)
   {  // Time to shoot!!!
@@ -258,7 +254,7 @@ void Controller::block(const ros::Time& time, const ros::Duration& period)
   if (state_changed_)
   {  // on enter
     state_changed_ = false;
-    ROS_INFO("[Shooter] Trigger Enter BLOCK");
+    ROS_INFO("[Shooter] Enter BLOCK");
     last_block_time_ = time;
     ctrl_trigger_.setCommand(ctrl_trigger_.joint_.getPosition() + config_.anti_block_angle);
   }
@@ -269,59 +265,45 @@ void Controller::block(const ros::Time& time, const ros::Duration& period)
     normalize();
     state_ = PUSH;
     state_changed_ = true;
-    ROS_INFO("[Shooter] Trigger Exit BLOCK");
+    ROS_INFO("[Shooter] Exit BLOCK");
   }
 }
 
 void Controller::setSpeed(const rm_msgs::ShootCmd& cmd)
 {
-  for (size_t i = 0; i < ctrls_friction_.size(); i++)
+  static int friction_block_count = 0;
+  bool friction_wheel_block = false;
+  for (auto& ctrl_friction_l : ctrls_friction_l_)
   {
-    for (size_t j = 0; j < ctrls_friction_[i].size(); j++)
-    {
-      if (wheel_speed_directions_[i][j] * ctrls_friction_[i][j]->joint_.getVelocity() <= friction_block_vel_ &&
-          abs(ctrls_friction_[i][j]->joint_.getEffort()) >= friction_block_effort_ && cmd.wheel_speed != 0)
-        friction_wheel_block = true;
-      else
-        friction_wheel_block = false;
-    }
+    if (ctrl_friction_l->joint_.getVelocity() <= friction_block_vel_ &&
+        abs(ctrl_friction_l->joint_.getEffort()) >= friction_block_effort_ && cmd.wheel_speed != 0)
+      friction_wheel_block = true;
+  }
+  for (auto& ctrl_friction_r : ctrls_friction_r_)
+  {
+    if (ctrl_friction_r->joint_.getVelocity() >= -1.0 * friction_block_vel_ &&
+        abs(ctrl_friction_r->joint_.getEffort()) >= friction_block_effort_ && cmd.wheel_speed != 0)
+      friction_wheel_block = true;
   }
   if (!friction_wheel_block)
   {
-    if (last_friction_wheel_block)
-    {
-      ROS_INFO("[Shooter] Frictions Exit BLOCK");
-      last_friction_wheel_block = false;
-    }
-    for (size_t i = 0; i < ctrls_friction_.size(); i++)
-    {
-      for (size_t j = 0; j < ctrls_friction_[i].size(); j++)
-      {
-        // Used to distinguish the front and rear friction wheels.
-        if (j == 0)
-          ctrls_friction_[i][j]->setCommand(
-              wheel_speed_directions_[i][j] *
-              (cmd_.wheel_speed + config_.extra_wheel_speed + cmd_.wheels_speed_offset_back));
-        if (j == 1)
-          ctrls_friction_[i][j]->setCommand(
-              wheel_speed_directions_[i][j] *
-              (cmd_.wheel_speed + config_.extra_wheel_speed + cmd_.wheels_speed_offset_front));
-      }
-    }
+    for (size_t i = 0; i < ctrls_friction_l_.size(); i++)
+      ctrls_friction_l_[i]->setCommand(cmd_.wheel_speed + config_.extra_wheel_speed + wheel_speed_offset_l_[i]);
+    for (size_t i = 0; i < ctrls_friction_r_.size(); i++)
+      ctrls_friction_r_[i]->setCommand(-cmd_.wheel_speed - config_.extra_wheel_speed - wheel_speed_offset_r_[i]);
   }
   else
   {
-    ROS_INFO("[Shooter] Frictions Enter BLOCK");
-    last_friction_wheel_block = true;
     double command = (friction_block_count <= static_cast<int>(anti_friction_block_duty_cycle_ * 1000)) ?
                          anti_friction_block_vel_ :
                          0.;
-    for (size_t i = 0; i < ctrls_friction_.size(); i++)
+    for (auto& ctrl_friction_l : ctrls_friction_l_)
     {
-      for (size_t j = 0; j < ctrls_friction_[i].size(); j++)
-      {
-        ctrls_friction_[i][j]->setCommand(command);
-      }
+      ctrl_friction_l->setCommand(command);
+    }
+    for (auto& ctrl_friction_r : ctrls_friction_r_)
+    {
+      ctrl_friction_r->setCommand(command);
     }
     friction_block_count = (friction_block_count + 1) % 1000;
   }
@@ -341,12 +323,12 @@ void Controller::normalize()
     enter_ready_ = false;
   }
   else
-    ctrl_trigger_.setCommand(push_angle * std::floor((ctrl_trigger_.joint_.getPosition() - 0.01) / push_angle));
+    ctrl_trigger_.setCommand(push_angle * std::floor((ctrl_trigger_.joint_.getPosition() - 0.08) / push_angle));
 }
 
 void Controller::judgeBulletShoot(const ros::Time& time, const ros::Duration& period)
 {
-  lp_filter_->input(ctrls_friction_[0][0]->joint_.getVelocity());
+  lp_filter_->input(ctrls_friction_l_[0]->joint_.getVelocity());
   double friction_speed = lp_filter_->output();
   double friction_change_speed = abs(friction_speed) - last_fricition_speed_;
   double friction_change_speed_derivative = friction_change_speed - last_friction_change_speed_;
