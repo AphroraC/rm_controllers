@@ -85,6 +85,18 @@ bool ChassisBase<T...>::init(hardware_interface::RobotHW* robot_hw, ros::NodeHan
   localization_sub_ = controller_nh.subscribe<geometry_msgs::TransformStamped>(
       localization_topic_, 10, &ChassisBase::localizationCallback, this);
 
+  // Setup odometry realtime publisher + odom message constant fields
+  odometry_rt_pub_ = realtime_tools::RealtimePublisher<nav_msgs::Odometry>(root_nh, "odom", 100);
+  odometry_rt_pub_.msg_.header.frame_id = robot_odom_frame_id_;
+  odometry_rt_pub_.msg_.child_frame_id = robot_base_frame_id_;
+  odometry_rt_pub_.msg_.twist.covariance = { 0.001, 0., 0., 0., 0., 0., 0.,
+                                              0.001, 0., 0., 0., 0., 0., 0.,
+                                              0.001, 0., 0., 0., 0., 0., 0.,
+                                              0.001, 0., 0., 0., 0., 0., 0.,
+                                              0.001, 0., 0., 0., 0., 0., 0.,
+                                              0.001 };
+
+
   ramp_x_ = std::make_unique<RampFilter<double>>(0, 0.001);
   ramp_y_ = std::make_unique<RampFilter<double>>(0, 0.001);
   ramp_w_ = std::make_unique<RampFilter<double>>(0, 0.001);
@@ -97,6 +109,13 @@ bool ChassisBase<T...>::init(hardware_interface::RobotHW* robot_hw, ros::NodeHan
     global_map2robot_odom_.transform.rotation.w = 1;
     brcst4global_map2robot_odom_.init(root_nh);
     brcst4global_map2robot_odom_.sendTransform(global_map2robot_odom_);
+
+    global_map2camera_init_.header.stamp = ros::Time::now();
+    global_map2camera_init_.header.frame_id = global_map_frame_id_;
+    global_map2camera_init_.child_frame_id = "camera_init";
+    global_map2camera_init_.transform.rotation.w = 1;
+    brcst4global_map2camera_init_.init(root_nh);
+    brcst4global_map2camera_init_.sendTransform(global_map2camera_init_);
   }
 
   if (publish_odom_tf_)
@@ -274,6 +293,7 @@ void ChassisBase<T...>::updateOdom(const ros::Time& time, const ros::Duration& p
             tf2::Quaternion(global_map2lidar_odom.transform.rotation.x, global_map2lidar_odom.transform.rotation.y,
                             global_map2lidar_odom.transform.rotation.z, global_map2lidar_odom.transform.rotation.w));
         odom_initialized_ = true;
+        global_map2camera_init_.transform = global_map2lidar_odom.transform;
       }
       catch (...)
       {
@@ -293,6 +313,7 @@ void ChassisBase<T...>::updateOdom(const ros::Time& time, const ros::Duration& p
         T_global_map2lidar_odom_.setRotation(
             tf2::Quaternion(localization->transform.rotation.x, localization->transform.rotation.y,
                             localization->transform.rotation.z, localization->transform.rotation.w));
+        global_map2camera_init_.transform = tf2::toMsg(T_global_map2lidar_odom_);
       }
       catch (...)
       {
@@ -330,6 +351,7 @@ void ChassisBase<T...>::updateOdom(const ros::Time& time, const ros::Duration& p
 
         T_global_map2robot_odom_ = T_global_map2lidar_odom_ * T_lidar_odom2lidar_base_ *
                                    T_robot_base2lidar_base_.inverse() * T_robot_odom_2robot_base_.inverse();
+
         global_map2robot_odom_.transform = tf2::toMsg(T_global_map2robot_odom_);
       }
       catch (...)
@@ -338,6 +360,7 @@ void ChassisBase<T...>::updateOdom(const ros::Time& time, const ros::Duration& p
       }
     }
     global_map2robot_odom_.header.stamp = time;
+    global_map2camera_init_.header.stamp = time;
   }
 
   if (publish_odom_tf_)
@@ -374,6 +397,18 @@ void ChassisBase<T...>::updateOdom(const ros::Time& time, const ros::Duration& p
         robot_odom2robot_base_.transform.rotation = tf2::toMsg(odom2base_quat);
       }
       robot_state_handle_.setTransform(robot_odom2robot_base_, "rm_chassis_controllers");
+
+      odometry_rt_pub_.msg_.header.stamp = time;
+      odometry_rt_pub_.msg_.pose.pose.position.x = robot_odom2robot_base_.transform.translation.x;
+      odometry_rt_pub_.msg_.pose.pose.position.y = robot_odom2robot_base_.transform.translation.y;
+      odometry_rt_pub_.msg_.pose.pose.position.z = robot_odom2robot_base_.transform.translation.z;
+      odometry_rt_pub_.msg_.pose.pose.orientation.x = robot_odom2robot_base_.transform.rotation.x;
+      odometry_rt_pub_.msg_.pose.pose.orientation.y = robot_odom2robot_base_.transform.rotation.y;
+      odometry_rt_pub_.msg_.pose.pose.orientation.z = robot_odom2robot_base_.transform.rotation.z;
+      odometry_rt_pub_.msg_.pose.pose.orientation.w = robot_odom2robot_base_.transform.rotation.w;
+      odometry_rt_pub_.twist.twist.linear.x = linear_vel_odom.x;
+      odometry_rt_pub_.twist.twist.linear.y = linear_vel_odom.y;
+      odometry_rt_pub_.twist.twist.angular.z = angular_vel_odom.z;
     }
     catch (...)
     {
@@ -384,10 +419,17 @@ void ChassisBase<T...>::updateOdom(const ros::Time& time, const ros::Duration& p
   if (publish_rate_ > 0.0 && last_publish_time_ + ros::Duration(1.0 / publish_rate_) < time)
   {
     if (publish_map_tf_)
+    {
       brcst4global_map2robot_odom_.sendTransform(global_map2robot_odom_);
+      brcst4global_map2camera_init_.sendTransform(global_map2camera_init_);
+    }
 
     if (publish_odom_tf_)
+    {
       brcst4robot_odom2robot_base_.sendTransform(robot_odom2robot_base_);
+      if(odometry_rt_pub_.trylock())
+        odometry_rt_pub_.unlockAndPublish();
+    }
 
     last_publish_time_ = time;
   }

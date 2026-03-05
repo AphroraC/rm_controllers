@@ -159,13 +159,17 @@ protected:
   realtime_tools::RealtimeBuffer<Command> cmd_rt_buffer_{};
   realtime_tools::RealtimeBuffer<nav_msgs::Odometry> slam_rt_buffer_{};
   realtime_tools::RealtimeBuffer<geometry_msgs::TransformStamped> localization_rt_buffer_{};
+  realtime_tools::RealtimePublisher<nav_msgs::Odometry> odometry_rt_pub_;
+
 
   rm_common::TfRtBroadcaster brcst4global_map2robot_odom_{};
   rm_common::TfRtBroadcaster brcst4robot_odom2robot_base_{};
+  rm_common::TfRtBroadcaster brcst4global_map2camera_init_{};
 
   geometry_msgs::TransformStamped global_map2robot_odom_{};
   geometry_msgs::TransformStamped robot_odom2robot_base_{};
   geometry_msgs::TransformStamped robot_base2lidar_base_{};
+  geometry_msgs::TransformStamped global_map2camera_init_{};
 
   tf2::Transform T_global_map2robot_odom_{};
   tf2::Transform T_robot_odom_2robot_base_{};
