@@ -47,7 +47,9 @@
 #include <geometry_msgs/TwistStamped.h>
 #include <geometry_msgs/Vector3Stamped.h>
 #include <nav_msgs/Odometry.h>
+#include <rm_msgs/ChassisActiveSusCmd.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <rm_chassis_controllers/PowerLimitConfig.h>
 #include <rm_common/ros_utilities.h>
 #include <rm_common/math_utilities.h>
 #include <rm_common/ori_tool.h>
@@ -63,6 +65,7 @@ struct Command
 {
   geometry_msgs::Twist cmd_vel_;
   rm_msgs::ChassisCmd cmd_chassis_;
+  rm_msgs::ChassisActiveSusCmd cmd_active_sus_;
   ros::Time stamp_;
 };
 template <typename... T>
@@ -108,7 +111,7 @@ protected:
    * @param time The current time.
    * @param period The time passed since the last call to update.
    */
-  void follow(const ros::Time& time, const ros::Duration& period);
+  virtual void follow(const ros::Time& time, const ros::Duration& period);
   /** @brief The mode TWIST: Just moving chassis.
    *
    * The mode TWIST: Chassis will move independent and will not effect by gimbal's move.
@@ -151,6 +154,7 @@ protected:
 
   void initialize_parameters(ros::NodeHandle& controller_nh);
   void slamCallback(const nav_msgs::Odometry::ConstPtr& msg);
+  void powerLimitReconfigCB(rm_chassis_controllers::PowerLimitConfig& config, uint32_t level);
   void localizationCallback(const geometry_msgs::TransformStamped::ConstPtr& msg);
 
   rm_control::RobotStateHandle robot_state_handle_{};
@@ -225,6 +229,24 @@ protected:
     FOLLOW,
     TWIST
   };
+  int state_ = RAW;
+  RampFilter<double>*ramp_x_{}, *ramp_y_{}, *ramp_w_{};
+  std::string follow_source_frame_{}, command_source_frame_{};
+
+  ros::Time last_publish_time_;
+  geometry_msgs::TransformStamped odom2base_{};
+  tf2::Transform world2odom_;
+  geometry_msgs::Vector3 vel_cmd_{};  // x, y
+  control_toolbox::Pid pid_follow_;
+
+  std::shared_ptr<realtime_tools::RealtimePublisher<nav_msgs::Odometry>> odom_pub_;
+  rm_common::TfRtBroadcaster tf_broadcaster_{};
+  ros::Subscriber outside_odom_sub_;
+  ros::Subscriber cmd_chassis_sub_;
+  ros::Subscriber cmd_vel_sub_;
+  Command cmd_struct_;
+  realtime_tools::RealtimeBuffer<Command> cmd_rt_buffer_;
+  realtime_tools::RealtimeBuffer<nav_msgs::Odometry> odom_buffer_;
 };
 
 }  // namespace rm_chassis_controllers
