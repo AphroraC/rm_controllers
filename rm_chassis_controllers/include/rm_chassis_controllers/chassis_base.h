@@ -163,10 +163,12 @@ protected:
 
   rm_common::TfRtBroadcaster brcst4global_map2robot_odom_{};
   rm_common::TfRtBroadcaster brcst4robot_odom2robot_base_{};
+  rm_common::TfRtBroadcaster brcst4global_map2camera_init_{};
 
   geometry_msgs::TransformStamped global_map2robot_odom_{};
   geometry_msgs::TransformStamped robot_odom2robot_base_{};
   geometry_msgs::TransformStamped robot_base2lidar_base_{};
+  geometry_msgs::TransformStamped global_map2camera_init_{};
 
   tf2::Transform T_global_map2robot_odom_{};
   tf2::Transform T_robot_odom_2robot_base_{};
@@ -196,6 +198,7 @@ protected:
   double max_odom_vel_{ 10.0 };
   double timeout_{ 0.1 };
 
+  bool gravity_estimation_offset_{ false };
   bool odom_initialized_{ false };
   bool slam_updated_{ false };
   bool localization_updated_{ false };
