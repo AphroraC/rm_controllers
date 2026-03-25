@@ -159,6 +159,7 @@ protected:
   realtime_tools::RealtimeBuffer<Command> cmd_rt_buffer_{};
   realtime_tools::RealtimeBuffer<nav_msgs::Odometry> slam_rt_buffer_{};
   realtime_tools::RealtimeBuffer<geometry_msgs::TransformStamped> localization_rt_buffer_{};
+  std::unique_ptr<realtime_tools::RealtimePublisher<nav_msgs::Odometry>> odometry_rt_pub_;
 
   rm_common::TfRtBroadcaster brcst4global_map2robot_odom_{};
   rm_common::TfRtBroadcaster brcst4robot_odom2robot_base_{};
